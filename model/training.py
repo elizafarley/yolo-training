@@ -1,5 +1,7 @@
 import argparse
+import csv
 import json
+import math
 import platform
 import os
 import shutil
@@ -7,19 +9,10 @@ import subprocess
 import sys
 from typing import List, Optional, Tuple
 
-# ultralytics depends on the GUI build of opencv-python, whose wheels need X11/GL shared
-# libraries that the Viam training image does not have, so `import cv2` fails. Overwrite the
-# cv2 package with the headless wheel (same API, no GUI deps) before ultralytics imports it.
-# --no-deps and --force-reinstall keep the opencv-python dist metadata that ultralytics requires.
-subprocess.check_call(
-    [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "--force-reinstall",
-     "opencv-python-headless>=4.7,<4.13"]
-)
-
 from sklearn.model_selection import train_test_split
-import torch
-from ultralytics import YOLO
 import yaml
+
+METRICS_FILE = "model_metrics.json"  # Viam reads this from the output directory and charts each key on the job page
 
 
 def parse_args(args):
@@ -39,16 +32,63 @@ def parse_args(args):
         # ex: 'green_square blue_triangle'
     )
     parser.add_argument(
-        "--base_model", dest="base_model", type=str, default="yolov8n.pt"
+        "--base_model", dest="base_model", type=str, default="yolo11s.pt"
     )
-    parsed_args = parser.parse_args(args)
+    # Train and export resolution. Raise it (960, 1280) for small objects in high-resolution frames.
+    parser.add_argument("--imgsz", dest="imgsz", type=int, default=640)
+    parser.add_argument("--patience", dest="patience", type=int, default=50)
+    parsed_args, unknown = parser.parse_known_args(args)
     return (
         parsed_args.data_json,
         parsed_args.model_dir,
         parsed_args.num_epochs,
         parsed_args.labels,
         parsed_args.base_model,
+        parsed_args.imgsz,
+        parsed_args.patience,
+        extra_train_args(unknown),
     )
+
+
+def extra_train_args(args):
+    """Turn leftover `--key=value` / `--key value` args into ultralytics train() kwargs (e.g. flipud=0.5, batch=32).
+
+    Values are parsed as YAML, so numbers, booleans and lists get their natural types.
+    """
+    out = {}
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if not arg.startswith("--"):
+            raise ValueError(f"unexpected argument {arg!r}")
+        key, sep, value = arg[2:].partition("=")
+        if not sep:
+            i += 1
+            if i == len(args):
+                raise ValueError(f"missing value for --{key}")
+            value = args[i]
+        out[key] = yaml.safe_load(value)
+        i += 1
+    return out
+
+
+def model_metrics(results_csv):
+    """Per-epoch metrics from ultralytics' results.csv, shaped for Viam's model_metrics.json.
+
+    Viam drops values that aren't lists and fails to parse NaN, so every key is a list of finite floats.
+    """
+    with open(results_csv, newline="") as f:
+        rows = [{k.strip(): v for k, v in row.items()} for row in csv.DictReader(f)]
+    metrics = {}
+    for col in rows[0] if rows else []:
+        if col in ("epoch", "time") or col.startswith("lr/"):
+            continue
+        key = col.replace("metrics/", "").replace("(B)", "").replace("/", "_")
+        values = [float(r[col]) for r in rows if r[col].strip()]
+        values = [v for v in values if math.isfinite(v)]
+        if values:
+            metrics[key] = values
+    return metrics
 
 
 def create_train_val_split(dataset, val_size=0.2, random_state=42):
@@ -252,15 +292,24 @@ def parse_filenames_and_bboxes_from_json(
 
 
 if __name__ == "__main__":
+    # ultralytics depends on the GUI build of opencv-python, whose wheels need X11/GL shared
+    # libraries that the Viam training image does not have, so `import cv2` fails. Overwrite the
+    # cv2 package with the headless wheel (same API, no GUI deps) before ultralytics imports it.
+    # --no-deps and --force-reinstall keep the opencv-python dist metadata that ultralytics requires.
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", "--force-reinstall",
+         "opencv-python-headless>=4.7,<4.13"]
+    )
+    import torch
+    from ultralytics import YOLO
+
     device: Optional[str] = "cpu"
     platform_str = platform.platform().lower()
 
-    DATA_JSON, MODEL_DIR, num_epochs, labels, BASE_MODEL = parse_args(sys.argv[1:])
-    patience = int(num_epochs / 2)
+    DATA_JSON, MODEL_DIR, num_epochs, labels, BASE_MODEL, imgsz, patience, extra = parse_args(sys.argv[1:])
 
     if "macos" in platform_str and "arm64" in platform_str:
         device = "mps"
-        patience = 30  # local testing cutoff
 
     if torch.cuda.is_available():
         device = str(torch.cuda.current_device())
@@ -303,21 +352,29 @@ if __name__ == "__main__":
     process_dataset(train_data, "train", dirs, class_to_idx)
     process_dataset(val_data, "val", dirs, class_to_idx)
 
+    train_args = {
+        "task": "detect",
+        "data": output_path,
+        "epochs": num_epochs,
+        "imgsz": imgsz,
+        "device": device,
+        "patience": patience,
+        **extra,
+    }
+    print(f"Training {BASE_MODEL} with {train_args}")
     model = YOLO(BASE_MODEL)
-    results = model.train(
-        task="detect",
-        data=output_path,
-        epochs=num_epochs,
-        imgsz=640,
-        device=device,
-        patience=patience,
-    )
+    results = model.train(**train_args)
 
-    export_path = model.export(format="onnx", device=device)
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    metrics = model_metrics(os.path.join(model.trainer.save_dir, "results.csv"))
+    with open(os.path.join(MODEL_DIR, METRICS_FILE), "w") as f:
+        json.dump(metrics, f)
+    print(f"Validation of the best checkpoint: {results.results_dict}")
+
+    export_path = model.export(format="onnx", device=device, imgsz=train_args["imgsz"])
 
     # # Move the exported model to the specified output directory
     if os.path.exists(export_path):
-        os.makedirs(MODEL_DIR, exist_ok=True)
         destination = os.path.join(MODEL_DIR, os.path.basename(export_path))
         shutil.copy2(export_path, destination)
         print(f"Model exported and copied to {destination}")
