@@ -50,9 +50,13 @@ def parse_args(args):
         choices=["viam", "ultralytics"],
         default="viam",
         help="viam: an ONNX model that Viam model evaluation and viam:onnx-cpu can run. "
-        "ultralytics: the plain Ultralytics export, for viam-labs:vision:yolov8.",
+        "ultralytics: the plain Ultralytics export, for hipsterbrown:mlmodel:yolo-onnx.",
     )
     parsed_args = parser.parse_args(args)
+    # Ultralytics rounds imgsz up to a multiple of 32 for training but not for export,
+    # so catch it here instead of after the GPU run
+    if parsed_args.imgsz % 32:
+        parser.error("imgsz must be a multiple of 32")
     return (
         parsed_args.data_json,
         parsed_args.model_dir,

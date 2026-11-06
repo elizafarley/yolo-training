@@ -1,6 +1,6 @@
 [project]
 name = "yolo-training"
-version = "0.1.10"
+version = "0.2.0"
 description = "A custom training script for training YOLO models on Viam datasets"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,3 +19,12 @@ dependencies = [
 
 [tool.setuptools]
 packages=["model"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

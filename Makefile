@@ -1,10 +1,13 @@
 install:
 	uv sync
 
+test:
+	uv run pytest
+
 clean:
 	rm -rf dist/ yolo_training.egg-info/
 
-.PHONY: build
+.PHONY: build test
 build:
 	uv build --sdist
 
