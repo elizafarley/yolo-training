@@ -21,7 +21,7 @@ import torch
 from ultralytics import YOLO
 import yaml
 
-from model.viam_export import export_viam_onnx
+from model.viam_export import check_raw_detection_output, export_viam_onnx
 
 
 def parse_args(args):
@@ -329,6 +329,9 @@ if __name__ == "__main__":
     process_dataset(val_data, "val", dirs, class_to_idx)
 
     model = YOLO(BASE_MODEL)
+    # Catch base models the viam export can't wrap before spending the GPU run on them
+    if export_format == "viam":
+        check_raw_detection_output(model.model.eval(), imgsz)
     results = model.train(
         task="detect",
         data=output_path,
