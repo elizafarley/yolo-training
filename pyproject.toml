@@ -1,6 +1,6 @@
 [project]
 name = "yolo-training"
-version = "0.1.9"
+version = "0.1.10"
 description = "A custom training script for training YOLO models on Viam datasets"
 readme = "README.md"
 requires-python = ">=3.10"
